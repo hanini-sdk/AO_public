@@ -1,0 +1,47 @@
+# Data-Lineage and Retro-Documentation (local) — pinned Python dependencies.
+#
+# On the WORK MACHINE install these from your internal PyPI mirror, e.g.:
+#   pip install --index-url https://<internal-mirror>/simple --no-cache-dir -r requirements.txt
+# (See README "Install on the work machine". Never install from public PyPI there.)
+#
+# Tested on Python 3.10 (Windows) and intended for 3.11+. Pins below are the
+# exact versions verified together; transitive deps resolve to compatible pins.
+
+# --- Web backend ---
+fastapi==0.115.6
+uvicorn==0.34.0
+python-multipart==0.0.20      # multipart form parsing for zip upload
+python-dotenv==1.0.1          # optional: load a gitignored .env
+
+# --- LLMAAS client (OpenAI-compatible) ---
+openai==1.59.6
+httpx==0.28.1                 # the guarded client lives in app/http_guard.py
+
+# --- SQL parsing / table-level lineage (pure-Python, no deps, no network) ---
+sqlglot==26.6.0
+
+# --- Local embedding index for RAG semantic search (optional, no PyTorch) ---
+# fastembed uses onnxruntime under the hood — no torch dependency (~120 MB total).
+# Model: BAAI/bge-small-en-v1.5 (47 MB ONNX), cached in ~/.cache/fastembed/
+# or at FASTEMBED_CACHE_PATH. Pre-seed the cache on a machine with internet
+# access, then copy to the work machine (see app/embeddings.py for instructions).
+# If fastembed is absent the app works normally; RAG falls back to lexical search.
+fastembed==0.4.2
+numpy==1.26.4                 # matrix ops for cosine similarity; transitive dep of fastembed
+
+# --- Deterministic structural parsing (text only; never executes code) ---
+# tree-sitter 0.25.x core supports grammar ABI 13-15 (older cores reject the
+# ABI-15 php/c-sharp grammars); the grammar pins below are verified against it.
+tree-sitter==0.25.2
+tree-sitter-python==0.23.6
+tree-sitter-bash==0.23.3
+tree-sitter-javascript==0.23.1
+tree-sitter-typescript==0.23.2
+tree-sitter-java==0.23.5
+tree-sitter-go==0.23.4
+tree-sitter-rust==0.23.2
+tree-sitter-c==0.23.4
+tree-sitter-cpp==0.23.4
+tree-sitter-c-sharp==0.23.1
+tree-sitter-ruby==0.23.1
+tree-sitter-php==0.23.11

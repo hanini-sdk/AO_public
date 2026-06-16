@@ -1,0 +1,42 @@
+# ── Secrets / local config — NEVER commit ──────────────────────────────────
+.env
+config.local.json
+
+# The original task prompt (personal note, not a project artifact)
+prompt.txt
+
+# ── Python ─────────────────────────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ── Generated at use time — NEVER commit ───────────────────────────────────
+# Root-anchored so the sample project's own data/ layer stays tracked.
+# (generated knowledge-graph.json / config.json)
+/data/
+# (extracted uploaded archives)
+/uploads/
+# Run diagnostics describe a specific analyzed project — never commit. Already
+# under /data/, but ignored anywhere as defense-in-depth.
+diagnostics.json
+diagnostics.md
+
+# ── Dashboard build (personal build machine only) ──────────────────────────
+# node_modules and caches are NOT committed; the COMPILED output in
+# web/dashboard/ IS committed and shipped (served as-is on the work machine).
+node_modules/
+tools/dashboard/node_modules/
+tools/dashboard/.vite/
+tools/dashboard/dist/
+
+# ── Upstream reference clone (not part of this repository) ─────────────────
+_reference_repo/
+
+# ── OS / editor cruft ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

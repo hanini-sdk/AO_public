@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import deque
+from difflib import get_close_matches
 from pathlib import Path
 
 from .config import DATA_DIR, Settings
@@ -52,6 +54,20 @@ _TOP_K = 150               # nodes and edges injected into the prompt
 _MAX_CONTEXT_CHARS = 8_000  # hard cap on context block size (enforced in build_rag_prompt)
 _MAX_HISTORY_TURNS = 6     # conversation turns kept in the prompt
 _CHAT_MAX_TOKENS = 1_500   # generous budget for RAG answers
+
+# BFS + fuzzy retrieval parameters
+_FUZZY_CUTOFF  = 0.75   # minimum similarity ratio for fuzzy name match (0–1)
+_BFS_MAX_DEPTH = 4      # maximum hops from the seed nodes in the lineage graph
+
+# Keywords that signal the user wants upstream (sources) vs downstream (consumers)
+_UPSTREAM_KEYWORDS = {
+    "vient", "source", "provient", "alimenté", "calculé", "dépend", "origine",
+    "comes", "fed", "derived", "computed", "origine", "calcul", "input",
+}
+_DOWNSTREAM_KEYWORDS = {
+    "utilisé", "impacte", "consommé", "envoyé", "cible", "impact", "alimente",
+    "used", "impacts", "flows", "consumed", "feeds", "output", "downstream",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -152,88 +168,223 @@ def _diverse_sample(nodes: list[dict], k: int) -> list[dict]:
     return result[:k]
 
 
+def _detect_direction(question: str) -> str:
+    """Infer lineage direction from the question vocabulary.
+
+    Returns "upstream", "downstream", or "both" (default).
+    """
+    q = _tokenize(question)
+    up   = bool(q & _UPSTREAM_KEYWORDS)
+    down = bool(q & _DOWNSTREAM_KEYWORDS)
+    if up and not down:  return "upstream"
+    if down and not up:  return "downstream"
+    return "both"
+
+
+def _build_name_map(edges: list[dict], node_by_id: dict[str, dict]) -> dict[str, str]:
+    """Map every source/target value in edges to a human-readable display name.
+
+    If the value is a node ID present in node_by_id, we use the node's ``name``
+    field (e.g. "variable_revenu"). Otherwise the raw value is used as-is —
+    this handles graphs where source/target already contain plain names instead
+    of structured IDs.
+    """
+    raw_values: set[str] = set()
+    for e in edges:
+        raw_values.add(e.get("source", ""))
+        raw_values.add(e.get("target", ""))
+    raw_values.discard("")
+
+    name_map: dict[str, str] = {}
+    for v in raw_values:
+        node = node_by_id.get(v)
+        name_map[v] = node["name"] if node else v
+    return name_map
+
+
+def _fuzzy_find_seeds(
+    q_tokens: set[str],
+    name_map: dict[str, str],
+    cutoff: float = _FUZZY_CUTOFF,
+) -> set[str]:
+    """Return raw edge-endpoint values whose display name fuzzy-matches any query token.
+
+    Two passes:
+      1. Substring — fast, zero false-negatives for partial names.
+      2. Fuzzy     — difflib SequenceMatcher covers typos and transpositions.
+
+    Each name is also split on common separators (. _ - : /) so that
+    "schema.table_name" can be matched by the token "table_name" alone.
+    """
+    # Build lookup: lowercase segment → original raw value
+    lower_to_raw: dict[str, str] = {}
+    for raw, display in name_map.items():
+        # full name
+        lower_to_raw[display.lower()] = raw
+        # each component after splitting on separators
+        for part in re.split(r"[._\-:/]", display.lower()):
+            if len(part) > 2:
+                lower_to_raw.setdefault(part, raw)
+
+    pool = list(lower_to_raw.keys())
+    seeds: set[str] = set()
+
+    for token in q_tokens:
+        # Pass 1 — substring in either direction
+        for name_lower, raw in lower_to_raw.items():
+            if token in name_lower or name_lower in token:
+                seeds.add(raw)
+        # Pass 2 — fuzzy match for typos (e.g. "varibale" → "variable")
+        for match in get_close_matches(token, pool, n=5, cutoff=cutoff):
+            seeds.add(lower_to_raw[match])
+
+    return seeds
+
+
+def _bfs_edges(
+    seed_values: set[str],
+    edges: list[dict],
+    max_depth: int = _BFS_MAX_DEPTH,
+    direction: str = "both",
+) -> list[dict]:
+    """BFS traversal from seed endpoint values along the edge graph.
+
+    Returns edges in BFS discovery order (closest to the seed first), so the
+    most directly relevant lineage appears at the top of the result list.
+
+    ``direction`` controls which edges are followed:
+      - "downstream" — follow source → target  (what does X feed into?)
+      - "upstream"   — follow target → source  (where does X come from?)
+      - "both"       — follow both directions
+    """
+    # Adjacency indexes keyed on raw source/target values
+    out_adj: dict[str, list[dict]] = {}   # source_value  → outgoing edges
+    in_adj:  dict[str, list[dict]] = {}   # target_value  → incoming edges
+    for e in edges:
+        src, tgt = e.get("source", ""), e.get("target", "")
+        if src: out_adj.setdefault(src, []).append(e)
+        if tgt: in_adj.setdefault(tgt, []).append(e)
+
+    visited:    set[str]     = set(seed_values)
+    seen_edges: set[tuple]   = set()          # (source, target, type) dedup key
+    result:     list[dict]   = []
+    frontier:   deque        = deque((v, 0) for v in seed_values)
+
+    def _emit(e: dict) -> None:
+        key = (e.get("source"), e.get("target"), e.get("type"))
+        if key not in seen_edges:
+            seen_edges.add(key)
+            result.append(e)
+
+    def _neighbors(value: str) -> list[tuple[str, dict]]:
+        found: list[tuple[str, dict]] = []
+        if direction in ("downstream", "both"):
+            for e in out_adj.get(value, []):
+                found.append((e.get("target", ""), e))
+        if direction in ("upstream", "both"):
+            for e in in_adj.get(value, []):
+                found.append((e.get("source", ""), e))
+        return found
+
+    # Depth-0: all edges that directly touch any seed (both directions)
+    for seed in seed_values:
+        for e in out_adj.get(seed, []) + in_adj.get(seed, []):
+            _emit(e)
+
+    # BFS expansion
+    while frontier:
+        value, depth = frontier.popleft()
+        if depth >= max_depth:
+            continue
+        for neighbor, edge in _neighbors(value):
+            if neighbor and neighbor not in visited:
+                visited.add(neighbor)
+                _emit(edge)
+                frontier.append((neighbor, depth + 1))
+
+    return result
+
+
 def retrieve_context(
     question: str, graph: dict, top_k: int = _TOP_K
 ) -> tuple[list[dict], list[dict]]:
     """Return (context_nodes, context_edges) relevant to the question.
 
-    Pure text-based retrieval — no embeddings, no ML libraries:
+    Edge-first lineage retrieval — no embeddings, no ML libraries:
       1. Keyword extraction  — lowercase tokens, stopwords removed.
-      2. Node scoring        — weighted match across name / path / tags / summary.
-      3. Node boost          — verbatim name matches forced to the front.
-      4. Top-k nodes         — top_k best-scored nodes (diverse fallback when all
-                               scores are zero).
-      5. Edge scoring        — weighted match across type / description /
-                               source-name / target-name.
-      6. Edge selection      — edges connecting two retained nodes (lineage
-                               expansion) come first; directly scored edges
-                               (score > 0) fill the rest up to top_k.
+      2. Name map            — resolve every edge source/target to a display name.
+      3. Fuzzy seed finding  — substring + fuzzy match (difflib) of query tokens
+                               against edge endpoint names; handles typos.
+      4. Direction detection — infer upstream / downstream / both from question
+                               vocabulary.
+      5. BFS traversal       — expand from seed endpoints along the edge graph up
+                               to _BFS_MAX_DEPTH hops; yields the lineage chain.
+      6. Fallback            — when BFS finds nothing, fall back to textual edge
+                               scoring so the chat is never empty.
+      7. Node recovery       — collect nodes referenced by context_edges, then
+                               complement with lexically-scored nodes.
 
-    Both ``nodes`` (English) and ``noeuds`` (French) field names are accepted,
-    and likewise ``edges`` / ``arretes``, so the function works with both the
-    standard schema and any French-keyed variant of the graph.
+    Both ``nodes``/``noeuds`` and ``edges``/``arretes`` field names are accepted.
     """
-    # Accept both English and French field names
     nodes: list[dict] = graph.get("nodes") or graph.get("noeuds") or []
     edges: list[dict] = graph.get("edges") or graph.get("arretes") or []
 
-    if not nodes:
+    if not edges and not nodes:
         return [], []
 
-    q_tokens = _tokenize(question)
+    q_tokens   = _tokenize(question)
     node_by_id = {n["id"]: n for n in nodes}
 
-    # ── 1. Score and rank nodes ──────────────────────────────────────────────
-    ranked = sorted(nodes, key=lambda n: -_score_node(n, q_tokens))
+    # ── 1. Build display-name index for every edge endpoint ──────────────────
+    name_map = _build_name_map(edges, node_by_id)
 
-    # ── 2. Structural name-match boost ───────────────────────────────────────
-    # A node whose name appears verbatim in the question (≥ 3 chars) is
-    # almost certainly what the user is asking about — promote it unconditionally.
-    q_lower     = question.lower()
-    boosted     = [n for n in ranked
-                   if len(n.get("name", "")) >= 3 and n["name"].lower() in q_lower]
-    boosted_ids = {n["id"] for n in boosted}
-    unboosted   = [n for n in ranked if n["id"] not in boosted_ids]
-    ranked      = boosted + unboosted
+    # ── 2. Fuzzy seed finding on source + target names ───────────────────────
+    seed_values = _fuzzy_find_seeds(q_tokens, name_map)
+    log.debug("BFS seeds: %s", seed_values)
 
-    # ── 3. Select top nodes ──────────────────────────────────────────────────
-    if all(_score_node(n, q_tokens) == 0.0 for n in ranked[:top_k]):
-        # No keyword matched anything — return a structurally diverse sample
-        # so the chat always has something meaningful to work with.
-        top_nodes = _diverse_sample(nodes, top_k)
+    # ── 3. BFS lineage traversal from seeds ──────────────────────────────────
+    direction = _detect_direction(question)
+    if seed_values:
+        context_edges = _bfs_edges(seed_values, edges, direction=direction)[:top_k]
     else:
-        top_nodes = ranked[:top_k]
+        context_edges = []
 
-    top_node_ids = {n["id"] for n in top_nodes}
+    # ── 4. Fallback — textual edge scoring when BFS finds nothing ────────────
+    # (no seed matched: generic question not about a specific entity)
+    if not context_edges:
+        edge_scores     = [_score_edge(e, q_tokens, node_by_id) for e in edges]
+        sorted_edge_idx = sorted(range(len(edges)), key=lambda i: -edge_scores[i])
+        scored_idx      = [i for i in sorted_edge_idx if edge_scores[i] > 0]
+        context_edges   = [edges[i] for i in scored_idx[:top_k]]
 
-    # ── 4. Score edges ───────────────────────────────────────────────────────
-    edge_scores = [_score_edge(e, q_tokens, node_by_id) for e in edges]
-    sorted_edge_idx = sorted(range(len(edges)), key=lambda i: -edge_scores[i])
+    # ── 5. Recover nodes referenced by context_edges ─────────────────────────
+    # Every endpoint that maps to a known node is included so the LLM gets
+    # the full node metadata (summary, tags…) for the lineage chain.
+    endpoint_values: set[str] = set()
+    for e in context_edges:
+        endpoint_values.add(e.get("source", ""))
+        endpoint_values.add(e.get("target", ""))
+    endpoint_values.discard("")
 
-    # ── 5. Lineage expansion + edge selection ────────────────────────────────
-    # Priority 1 — connecting edges: both endpoints are in the retained node
-    # set. These capture the data-flow lineage between the selected nodes and
-    # are included regardless of their own text score.
-    connecting_idx = [
-        i for i in sorted_edge_idx
-        if edges[i].get("source") in top_node_ids
-        and edges[i].get("target") in top_node_ids
-    ]
-    connecting_set = set(connecting_idx)
+    edge_nodes   = [node_by_id[v] for v in endpoint_values if v in node_by_id]
+    included_ids = {n["id"] for n in edge_nodes}
 
-    # Priority 2 — directly scored edges: at least one keyword matched the
-    # edge's own fields (type / description / endpoint names). Included even
-    # when one or both endpoint nodes did not make the top-k node list, so
-    # cross-boundary lineage is still surfaced.
-    scored_extra_idx = [
-        i for i in sorted_edge_idx
-        if i not in connecting_set and edge_scores[i] > 0
-    ]
+    # Fill remaining budget with lexically-scored nodes not already present
+    budget = top_k - len(edge_nodes)
+    if budget > 0 and q_tokens:
+        extra = sorted(
+            [n for n in nodes if n["id"] not in included_ids],
+            key=lambda n: -_score_node(n, q_tokens),
+        )[:budget]
+    elif budget > 0:
+        extra = _diverse_sample(
+            [n for n in nodes if n["id"] not in included_ids], budget
+        )
+    else:
+        extra = []
 
-    all_edge_idx  = (connecting_idx + scored_extra_idx)[:top_k]
-    context_edges = [edges[i] for i in all_edge_idx]
-
-    return top_nodes, context_edges
+    context_nodes = edge_nodes + extra
+    return context_nodes, context_edges
 
 
 # ---------------------------------------------------------------------------

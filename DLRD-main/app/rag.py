@@ -505,15 +505,17 @@ def _extract_cited_ids(answer: str, valid_ids: set[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _extract_entity(question: str, llm: LLMClient) -> str | None:
-    """Ask the LLM to extract the variable/column/table name from the question.
+    """Extract the variable/column/table name from the question via a cheap LLM call.
 
-    Returns the raw name string, or None when no specific entity is found.
-    The call is cheap: no graph context, max _EXTRACT_MAX_TOKENS tokens.
-    Falls back to None on any error so the full question is used as fallback.
+    Returns the raw name string so the fuzzy matcher works on the exact entity
+    and is not polluted by the surrounding question text (e.g. "donne moi les
+    colonnes liées à" would otherwise produce false positive token matches).
+    Returns None on failure or when no specific name is found; the caller then
+    falls back to passing the full question to retrieve_context.
     """
     prompt = (
         "Extract the exact variable, column, or table name mentioned in the question. "
-        "Return ONLY the name, nothing else. "
+        "Return ONLY the name, no explanation, no punctuation. "
         "If no specific name is mentioned, return null.\n\n"
         f"Question: {question}\n\nName:"
     )
@@ -522,11 +524,12 @@ def _extract_entity(question: str, llm: LLMClient) -> str | None:
             [{"role": "user", "content": prompt}],
             max_tokens=_EXTRACT_MAX_TOKENS,
         ).strip().strip('"\'')
-        if not raw or raw.lower() in ("null", "none", "aucun", "n/a", ""):
+        if not raw or raw.lower() in ("null", "none", "aucun", "n/a"):
             return None
+        log.debug("Entity extracted: %r", raw)
         return raw
     except Exception as exc:
-        log.debug("Entity extraction failed (%s)", exc)
+        log.debug("Entity extraction failed (%s), using full question", exc)
         return None
 
 
@@ -562,15 +565,8 @@ def answer_question(
             "sources": [],
         }
 
-    # ── LLM pre-call: extract the target entity name ─────────────────────────
-    # Sending only the entity name (not the full question) to the fuzzy
-    # matcher avoids polluting edge matching with surrounding question words.
     entity = _extract_entity(question, llm)
-    retrieval_query = entity if entity else question
-    log.debug("Entity extracted: %r → retrieval query: %r", entity, retrieval_query)
-
-    context_nodes, context_edges = retrieve_context(retrieval_query, graph)
-
+    context_nodes, context_edges = retrieve_context(entity or question, graph)
     messages = build_rag_prompt(
         question=question,
         context_nodes=context_nodes,

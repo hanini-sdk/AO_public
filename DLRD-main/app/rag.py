@@ -181,64 +181,66 @@ def _detect_direction(question: str) -> str:
     return "both"
 
 
-def _build_name_map(edges: list[dict], node_by_id: dict[str, dict]) -> dict[str, str]:
-    """Map every source/target value in edges to a human-readable display name.
-
-    If the value is a node ID present in node_by_id, we use the node's ``name``
-    field (e.g. "variable_revenu"). Otherwise the raw value is used as-is —
-    this handles graphs where source/target already contain plain names instead
-    of structured IDs.
-    """
-    raw_values: set[str] = set()
-    for e in edges:
-        raw_values.add(e.get("source", ""))
-        raw_values.add(e.get("target", ""))
-    raw_values.discard("")
-
-    name_map: dict[str, str] = {}
-    for v in raw_values:
-        node = node_by_id.get(v)
-        name_map[v] = node["name"] if node else v
-    return name_map
-
-
-def _fuzzy_find_seeds(
+def _find_seed_edges(
     q_tokens: set[str],
-    name_map: dict[str, str],
+    edges: list[dict],
     cutoff: float = _FUZZY_CUTOFF,
-) -> set[str]:
-    """Return raw edge-endpoint values whose display name fuzzy-matches any query token.
+) -> tuple[set[str], list[dict]]:
+    """Find edges whose source or target matches any query token.
 
-    Two passes:
-      1. Substring — fast, zero false-negatives for partial names.
-      2. Fuzzy     — difflib SequenceMatcher covers typos and transpositions.
+    Matching is done directly on the raw source/target strings of each edge —
+    no node lookup, no indirection. Each value is split on common separators
+    (. _ - : /) so that "schema.table_revenu" can be matched by "revenu" alone.
 
-    Each name is also split on common separators (. _ - : /) so that
-    "schema.table_name" can be matched by the token "table_name" alone.
+    Two passes per token:
+      1. Substring — token contained in the segment, or segment in the token.
+      2. Fuzzy     — difflib covers typos (e.g. "varibale" → "variable").
+
+    Returns (seed_values, seed_edges):
+      - seed_values : the source/target strings of the matched edges, used as
+                      BFS starting points.
+      - seed_edges  : the edges that matched directly (included at depth-0).
     """
-    # Build lookup: lowercase segment → original raw value
-    lower_to_raw: dict[str, str] = {}
-    for raw, display in name_map.items():
-        # full name
-        lower_to_raw[display.lower()] = raw
-        # each component after splitting on separators
-        for part in re.split(r"[._\-:/]", display.lower()):
-            if len(part) > 2:
-                lower_to_raw.setdefault(part, raw)
+    # Build segment index: lowercase segment → set of raw endpoint values
+    # A single raw value like "db.schema.col_name" produces segments
+    # ["db", "schema", "col_name"] in addition to the full string.
+    seg_to_raws: dict[str, set[str]] = {}
+    for e in edges:
+        for raw in (e.get("source", ""), e.get("target", "")):
+            if not raw:
+                continue
+            parts = [raw.lower()] + [
+                p for p in re.split(r"[._\-:/]", raw.lower()) if len(p) > 2
+            ]
+            for part in parts:
+                seg_to_raws.setdefault(part, set()).add(raw)
 
-    pool = list(lower_to_raw.keys())
-    seeds: set[str] = set()
+    pool = list(seg_to_raws.keys())
 
+    # Find matched raw endpoint values
+    matched_values: set[str] = set()
     for token in q_tokens:
-        # Pass 1 — substring in either direction
-        for name_lower, raw in lower_to_raw.items():
-            if token in name_lower or name_lower in token:
-                seeds.add(raw)
-        # Pass 2 — fuzzy match for typos (e.g. "varibale" → "variable")
-        for match in get_close_matches(token, pool, n=5, cutoff=cutoff):
-            seeds.add(lower_to_raw[match])
+        # Pass 1 — substring
+        for seg, raws in seg_to_raws.items():
+            if token in seg or seg in token:
+                matched_values |= raws
+        # Pass 2 — fuzzy (typo tolerance)
+        for m in get_close_matches(token, pool, n=5, cutoff=cutoff):
+            matched_values |= seg_to_raws[m]
 
-    return seeds
+    # Select edges where source OR target is a matched value
+    seed_edges = [
+        e for e in edges
+        if e.get("source") in matched_values or e.get("target") in matched_values
+    ]
+
+    # Seed values = all endpoints of matched edges (both sides of the relation)
+    seed_values: set[str] = set()
+    for e in seed_edges:
+        if e.get("source"): seed_values.add(e["source"])
+        if e.get("target"): seed_values.add(e["target"])
+
+    return seed_values, seed_edges
 
 
 def _bfs_edges(
@@ -335,29 +337,26 @@ def retrieve_context(
     q_tokens   = _tokenize(question)
     node_by_id = {n["id"]: n for n in nodes}
 
-    # ── 1. Build display-name index for every edge endpoint ──────────────────
-    name_map = _build_name_map(edges, node_by_id)
+    # ── 1. Find seed edges: match tokens against source/target of each edge ──
+    seed_values, _seed_edges = _find_seed_edges(q_tokens, edges)
+    log.debug("BFS seeds (%d): %s", len(seed_values), seed_values)
 
-    # ── 2. Fuzzy seed finding on source + target names ───────────────────────
-    seed_values = _fuzzy_find_seeds(q_tokens, name_map)
-    log.debug("BFS seeds: %s", seed_values)
-
-    # ── 3. BFS lineage traversal from seeds ──────────────────────────────────
+    # ── 2. BFS lineage traversal from seeds ──────────────────────────────────
     direction = _detect_direction(question)
     if seed_values:
         context_edges = _bfs_edges(seed_values, edges, direction=direction)[:top_k]
     else:
         context_edges = []
 
-    # ── 4. Fallback — textual edge scoring when BFS finds nothing ────────────
-    # (no seed matched: generic question not about a specific entity)
+    # ── 3. Fallback — textual edge scoring when BFS finds nothing ────────────
+    # (no seed matched: generic question not targeting a specific entity)
     if not context_edges:
         edge_scores     = [_score_edge(e, q_tokens, node_by_id) for e in edges]
         sorted_edge_idx = sorted(range(len(edges)), key=lambda i: -edge_scores[i])
         scored_idx      = [i for i in sorted_edge_idx if edge_scores[i] > 0]
         context_edges   = [edges[i] for i in scored_idx[:top_k]]
 
-    # ── 5. Recover nodes referenced by context_edges ─────────────────────────
+    # ── 4. Recover nodes referenced by context_edges ─────────────────────────
     # Every endpoint that maps to a known node is included so the LLM gets
     # the full node metadata (summary, tags…) for the lineage chain.
     endpoint_values: set[str] = set()

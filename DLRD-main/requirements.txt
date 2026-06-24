@@ -1,0 +1,57 @@
+# Data-Lineage and Retro-Documentation (local) — pinned Python dependencies.
+#
+# On the WORK MACHINE install these from your internal PyPI mirror, e.g.:
+#   pip install --index-url https://<internal-mirror>/simple --no-cache-dir -r requirements.txt
+# (See README "Install on the work machine". Never install from public PyPI there.)
+#
+# Tested on Python 3.10 (Windows) and intended for 3.11+. Pins below are the
+# exact versions verified together; transitive deps resolve to compatible pins.
+
+# --- Web backend ---
+fastapi==0.115.6
+uvicorn==0.34.0
+python-multipart==0.0.20      # multipart form parsing for zip upload
+python-dotenv==1.0.1          # optional: load a gitignored .env
+
+# --- LLMAAS client (OpenAI-compatible) ---
+openai==1.59.6
+httpx==0.28.1                 # the guarded client lives in app/http_guard.py
+
+# --- SQL parsing / table-level lineage (pure-Python, no deps, no network) ---
+sqlglot==26.6.0
+
+# --- Variable-dictionary ingestion: read .xlsx/.xlsm VALUES ONLY (formulas are
+# never evaluated, macros never executed). CSV uses the stdlib; this is only
+# needed for Excel dictionaries and is imported lazily, so its absence just
+# skips Excel files. Pure-Python, no network. ---
+openpyxl==3.1.5
+
+# --- Word document reading (auxiliary prose context): OPTIONAL lazy FALLBACK
+# only. The default .docx/.docm reader is the stdlib (zipfile + xml.etree over
+# word/document.xml), so this is not required for normal Word files; it is
+# imported lazily and its absence just degrades to the stdlib path / a skip.
+# Pure-Python, no network. NOTE: confirm it is available on the internal mirror
+# before relying on it; if not, the stdlib reader still covers standard files. ---
+python-docx==1.1.2
+
+# --- Numeric arrays for the chat's optional local retrieval index (no network).
+# Used only when the optional embedding backend is enabled; the chat works
+# without it via lexical retrieval, so numpy alone never reaches any host. ---
+numpy==1.26.4
+
+# --- Deterministic structural parsing (text only; never executes code) ---
+# tree-sitter 0.25.x core supports grammar ABI 13-15 (older cores reject the
+# ABI-15 php/c-sharp grammars); the grammar pins below are verified against it.
+tree-sitter==0.25.2
+tree-sitter-python==0.23.6
+tree-sitter-bash==0.23.3
+tree-sitter-javascript==0.23.1
+tree-sitter-typescript==0.23.2
+tree-sitter-java==0.23.5
+tree-sitter-go==0.23.4
+tree-sitter-rust==0.23.2
+tree-sitter-c==0.23.4
+tree-sitter-cpp==0.23.4
+tree-sitter-c-sharp==0.23.1
+tree-sitter-ruby==0.23.1
+tree-sitter-php==0.23.11

@@ -1,0 +1,42 @@
+{
+  "name": "data-lineage-retro-documentation-dashboard-build",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Self-contained build of the Data-Lineage and Retro-Documentation dashboard (adapted from an upstream MIT project; see LICENSE). Personal build machine only; never installed on the work machine.",
+  "scripts": {
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@dagrejs/dagre": "^2.0.4",
+    "@xyflow/react": "^12.3.5",
+    "d3-force": "^3.0.0",
+    "devlop": "^1.1.0",
+    "elkjs": "^0.9.3",
+    "fuse.js": "^7.1.0",
+    "graphology": "^0.25.4",
+    "graphology-communities-louvain": "^2.0.2",
+    "graphology-types": "^0.24.8",
+    "hast-util-to-jsx-runtime": "^2.3.6",
+    "prism-react-renderer": "^2.4.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "zod": "^4.3.6",
+    "zustand": "^5.0.3",
+    "@fontsource/inter": "^5.1.1",
+    "@fontsource/dm-serif-display": "^5.1.1",
+    "@fontsource/jetbrains-mono": "^5.1.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/d3-force": "^3.0.10",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.7"
+  }
+}

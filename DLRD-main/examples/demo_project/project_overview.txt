@@ -1,0 +1,14 @@
+Demo project overview
+=====================
+
+This demo pipeline loads customer and order data and builds a single fact
+table, demo.t_customer_orders, that aggregates each customer's orders. It is a
+small, fictional illustration only.
+
+The total_amount column is the headline metric: the summed order amount per
+customer. customer_name carries the customer's display name, used by the name
+report. The revenue report reads the same fact table.
+
+The orchestrator runs the loaders first, then the transform that populates
+demo.t_customer_orders, and finally a reporting step. No real data is used and
+nothing here is executed by the analyzer — it is parsed as prose for context.

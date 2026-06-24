@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Data-Lineage and Retro-Documentation — Local</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="head">
+        <h1>Data-Lineage and Retro-Documentation <span class="muted">· local</span></h1>
+        <p class="subtitle">
+          Turn a project into an interactive knowledge graph — analysed locally,
+          enriched only by your configured LLMAAS. No other network egress.
+        </p>
+      </header>
+
+      <!-- ============================= Configuration ============================= -->
+      <section class="card" id="config-card">
+        <div class="card-head">
+          <h2>1 · Connection</h2>
+          <span class="badge" id="config-badge">checking…</span>
+        </div>
+
+        <label for="apiBase">API base URL <span class="hint">(keep any <code>/v1</code> suffix)</span></label>
+        <input id="apiBase" type="text" autocomplete="off" spellcheck="false"
+               placeholder="https://your-llmaas-host/v1" />
+
+        <label for="apiKey">API key <span class="hint">(stored only in a gitignored local file; never committed or logged)</span></label>
+        <input id="apiKey" type="password" autocomplete="off" placeholder="paste your key" />
+
+        <div class="row">
+          <div class="col">
+            <label for="model">Model</label>
+            <input id="model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. gpt-oss-120b / codestral-2503 / gemma-3-27b-it" />
+          </div>
+          <div class="col">
+            <label for="language">Output language</label>
+            <select id="language">
+              <option value="en">English</option>
+              <option value="fr">Français (fr)</option>
+            </select>
+          </div>
+        </div>
+
+        <label for="caCertPath">CA certificate path
+          <span class="hint">(optional — path to your internal CA bundle, e.g. <code>cacert.pem</code>; leave blank for public CAs. TLS is always verified.)</span>
+        </label>
+        <input id="caCertPath" type="text" autocomplete="off" spellcheck="false"
+               placeholder="C:\path\to\cacert.pem   (leave blank for public endpoints)" />
+
+        <label class="check">
+          <input id="supportsSystem" type="checkbox" checked />
+          Model supports <code>system</code> messages
+          <span class="hint">(uncheck for gemma &amp; similar — the system prompt is folded into the first user message)</span>
+        </label>
+
+        <div class="actions">
+          <button id="btn-test" class="btn">Test connection</button>
+          <button id="btn-save" class="btn btn-primary">Save</button>
+        </div>
+        <p id="config-msg" class="msg"></p>
+      </section>
+
+      <!-- ============================= Analysis ============================= -->
+      <section class="card" id="analyze-card">
+        <div class="card-head">
+          <h2>2 · Analyse a project</h2>
+        </div>
+
+        <div class="tabs">
+          <button class="tab tab-active" id="tab-folder" data-tab="folder">Local folder</button>
+          <button class="tab" id="tab-zip" data-tab="zip">Upload .zip</button>
+        </div>
+
+        <div id="panel-folder" class="panel">
+          <label for="folderPath">Folder path on this machine</label>
+          <input id="folderPath" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="C:\path\to\project   or   /home/me/project" />
+        </div>
+
+        <div id="panel-zip" class="panel hidden">
+          <label for="zipFile">Project archive (.zip) — extracted and processed locally</label>
+          <input id="zipFile" type="file" accept=".zip,application/zip" />
+        </div>
+
+        <label for="projectName">Project name <span class="hint">(optional)</span></label>
+        <input id="projectName" type="text" autocomplete="off" placeholder="defaults to the folder / archive name" />
+
+        <div class="actions">
+          <button id="btn-analyze" class="btn btn-primary" disabled>Start analysis</button>
+          <a id="open-dashboard" class="btn btn-ghost hidden" href="/dashboard/">Open dashboard →</a>
+        </div>
+
+        <div id="progress" class="progress hidden">
+          <div class="bar"><div id="bar-fill" class="bar-fill"></div></div>
+          <div class="progress-meta">
+            <span id="phase" class="phase"></span>
+            <span id="percent" class="percent"></span>
+          </div>
+          <div id="current-file" class="current-file"></div>
+          <div id="stats" class="stats"></div>
+        </div>
+        <p id="analyze-msg" class="msg"></p>
+      </section>
+
+      <footer class="foot">
+        <span>Bound to 127.0.0.1 · single egress = your LLMAAS apiBase · the analysed code is never executed.</span>
+      </footer>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -53,8 +53,8 @@ _STOP_WORDS = {
 _TOP_K = 150               # nodes and edges injected into the prompt
 _MAX_CONTEXT_CHARS = 8_000  # hard cap on context block size (enforced in build_rag_prompt)
 _MAX_HISTORY_TURNS = 6     # conversation turns kept in the prompt
-_CHAT_MAX_TOKENS     = 1_500  # budget for the final RAG answer
-_CLASSIFY_MAX_TOKENS = 120   # budget for the question-classification pre-call
+_CHAT_MAX_TOKENS    = 1_500  # budget for the final RAG answer
+_EXTRACT_MAX_TOKENS = 60     # budget for the entity-extraction pre-call
 
 # BFS + fuzzy retrieval parameters
 _FUZZY_CUTOFF  = 0.75   # minimum similarity ratio for fuzzy name match (0–1)
@@ -329,37 +329,6 @@ def retrieve_context(
     return [], context_edges
 
 
-def retrieve_context_nodes(
-    question: str, graph: dict, top_k: int = _TOP_K
-) -> tuple[list[dict], list[dict]]:
-    """Node-based retrieval for general (non-lineage) questions.
-
-    Scores nodes by lexical matching on name / path / tags / summary, applies
-    a verbatim name-match boost, and returns the top-k nodes with no edges.
-    Used when the LLM classifier determines the question is not about data lineage.
-    """
-    nodes: list[dict] = graph.get("nodes") or graph.get("noeuds") or []
-
-    if not nodes:
-        return [], []
-
-    q_tokens = _tokenize(question)
-
-    ranked = sorted(nodes, key=lambda n: -_score_node(n, q_tokens))
-
-    # Verbatim name-match boost
-    q_lower     = question.lower()
-    boosted     = [n for n in ranked
-                   if len(n.get("name", "")) >= 3 and n["name"].lower() in q_lower]
-    boosted_ids = {n["id"] for n in boosted}
-    ranked      = boosted + [n for n in ranked if n["id"] not in boosted_ids]
-
-    if all(_score_node(n, q_tokens) == 0.0 for n in ranked[:top_k]):
-        return _diverse_sample(nodes, top_k), []
-
-    return ranked[:top_k], []
-
-
 # ---------------------------------------------------------------------------
 # Prompt building
 # ---------------------------------------------------------------------------
@@ -532,56 +501,33 @@ def _extract_cited_ids(answer: str, valid_ids: set[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Question classification (LLM pre-call)
+# Entity extraction (LLM pre-call)
 # ---------------------------------------------------------------------------
 
-def _classify_question(question: str, llm: LLMClient) -> dict:
-    """Ask the LLM to classify the question and extract the target entity.
+def _extract_entity(question: str, llm: LLMClient) -> str | None:
+    """Ask the LLM to extract the variable/column/table name from the question.
 
-    Returns {"type": "lineage"|"general", "entity": str|None}.
-
-    - "lineage" : the question traces a specific variable / column / table
-                  through the data pipeline. ``entity`` is the extracted name.
-    - "general" : any other question (architecture, explanation, statistics…).
-                  ``entity`` is None.
-
-    On any failure (LLM error, invalid JSON) falls back to
-    {"type": "lineage", "entity": None} so the edge-based BFS is always tried.
-    The call is intentionally cheap: no graph context, no system message,
-    max _CLASSIFY_MAX_TOKENS tokens.
+    Returns the raw name string, or None when no specific entity is found.
+    The call is cheap: no graph context, max _EXTRACT_MAX_TOKENS tokens.
+    Falls back to None on any error so the full question is used as fallback.
     """
     prompt = (
-        "You are a data lineage assistant. Analyze the user question below and "
-        "respond with JSON only — no explanation, no markdown.\n\n"
-        "Rules:\n"
-        '- question_type = "lineage" if the question asks to trace, find, or '
-        "follow a specific variable, column, or table through a data pipeline "
-        '(examples: "where is X used?", "what feeds X?", "what does X impact?", '
-        '"give me all variables linked to X", "donne moi les colonnes liées à X", '
-        '"quel est le parcours de X").\n'
-        '- question_type = "general" for any other question (how the code works, '
-        "architecture overview, what a file does, statistics, etc.).\n"
-        "- entity = the exact variable/column/table name the user mentioned, or null.\n\n"
-        f"Question: {question}\n\n"
-        'JSON: {"question_type": "lineage" or "general", "entity": "name" or null}'
+        "Extract the exact variable, column, or table name mentioned in the question. "
+        "Return ONLY the name, nothing else. "
+        "If no specific name is mentioned, return null.\n\n"
+        f"Question: {question}\n\nName:"
     )
     try:
         raw = llm.chat(
             [{"role": "user", "content": prompt}],
-            max_tokens=_CLASSIFY_MAX_TOKENS,
-        )
-        # LLM may wrap JSON in markdown fences — extract the first {...} block
-        m = re.search(r"\{[^}]+\}", raw, re.DOTALL)
-        data = json.loads(m.group() if m else raw)
-        qtype  = data.get("question_type", "lineage")
-        entity = data.get("entity") or None
-        if qtype not in ("lineage", "general"):
-            qtype = "lineage"
-        log.debug("Classification: type=%s entity=%r", qtype, entity)
-        return {"type": qtype, "entity": entity}
+            max_tokens=_EXTRACT_MAX_TOKENS,
+        ).strip().strip('"\'')
+        if not raw or raw.lower() in ("null", "none", "aucun", "n/a", ""):
+            return None
+        return raw
     except Exception as exc:
-        log.debug("Classification failed (%s), defaulting to lineage", exc)
-        return {"type": "lineage", "entity": None}
+        log.debug("Entity extraction failed (%s)", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -616,20 +562,14 @@ def answer_question(
             "sources": [],
         }
 
-    # ── LLM pre-call: classify question and extract entity ───────────────────
-    classification = _classify_question(question, llm)
-    q_type = classification["type"]
-    entity = classification["entity"]
+    # ── LLM pre-call: extract the target entity name ─────────────────────────
+    # Sending only the entity name (not the full question) to the fuzzy
+    # matcher avoids polluting edge matching with surrounding question words.
+    entity = _extract_entity(question, llm)
+    retrieval_query = entity if entity else question
+    log.debug("Entity extracted: %r → retrieval query: %r", entity, retrieval_query)
 
-    if q_type == "lineage":
-        # Pass only the extracted entity name to the edge-based BFS so the
-        # fuzzy matching is not polluted by the surrounding question text.
-        # Fall back to the full question when the entity was not identified.
-        retrieval_query = entity if entity else question
-        context_nodes, context_edges = retrieve_context(retrieval_query, graph)
-    else:
-        # General question: use node-based context, ignore edges.
-        context_nodes, context_edges = retrieve_context_nodes(question, graph)
+    context_nodes, context_edges = retrieve_context(retrieval_query, graph)
 
     messages = build_rag_prompt(
         question=question,

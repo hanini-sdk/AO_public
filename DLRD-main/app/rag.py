@@ -22,7 +22,7 @@ import json
 import logging
 import re
 from collections import deque
-from difflib import get_close_matches
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from .config import DATA_DIR, Settings
@@ -181,66 +181,39 @@ def _detect_direction(question: str) -> str:
     return "both"
 
 
-def _find_seed_edges(
-    q_tokens: set[str],
-    edges: list[dict],
-    cutoff: float = _FUZZY_CUTOFF,
-) -> tuple[set[str], list[dict]]:
-    """Find edges whose source or target matches any query token.
+def _seg_best(token: str, value: str) -> float:
+    """Best SequenceMatcher similarity between a token and any segment of value.
 
-    Matching is done directly on the raw source/target strings of each edge —
-    no node lookup, no indirection. Each value is split on common separators
-    (. _ - : /) so that "schema.table_revenu" can be matched by "revenu" alone.
-
-    Two passes per token:
-      1. Substring — token contained in the segment, or segment in the token.
-      2. Fuzzy     — difflib covers typos (e.g. "varibale" → "variable").
-
-    Returns (seed_values, seed_edges):
-      - seed_values : the source/target strings of the matched edges, used as
-                      BFS starting points.
-      - seed_edges  : the edges that matched directly (included at depth-0).
+    value is split on separators (. _ - : /) so that "db.schema.col_revenu"
+    is matchable by the token "revenu" alone (score ~1.0 on that segment).
     """
-    # Build segment index: lowercase segment → set of raw endpoint values
-    # A single raw value like "db.schema.col_name" produces segments
-    # ["db", "schema", "col_name"] in addition to the full string.
-    seg_to_raws: dict[str, set[str]] = {}
-    for e in edges:
-        for raw in (e.get("source", ""), e.get("target", "")):
-            if not raw:
-                continue
-            parts = [raw.lower()] + [
-                p for p in re.split(r"[._\-:/]", raw.lower()) if len(p) > 2
-            ]
-            for part in parts:
-                seg_to_raws.setdefault(part, set()).add(raw)
-
-    pool = list(seg_to_raws.keys())
-
-    # Find matched raw endpoint values
-    matched_values: set[str] = set()
-    for token in q_tokens:
-        # Pass 1 — substring
-        for seg, raws in seg_to_raws.items():
-            if token in seg or seg in token:
-                matched_values |= raws
-        # Pass 2 — fuzzy (typo tolerance)
-        for m in get_close_matches(token, pool, n=5, cutoff=cutoff):
-            matched_values |= seg_to_raws[m]
-
-    # Select edges where source OR target is a matched value
-    seed_edges = [
-        e for e in edges
-        if e.get("source") in matched_values or e.get("target") in matched_values
+    segs = [value.lower()] + [
+        p for p in re.split(r"[._\-:/]", value.lower()) if len(p) > 2
     ]
+    return max(SequenceMatcher(None, token, seg).ratio() for seg in segs)
 
-    # Seed values = all endpoints of matched edges (both sides of the relation)
-    seed_values: set[str] = set()
-    for e in seed_edges:
-        if e.get("source"): seed_values.add(e["source"])
-        if e.get("target"): seed_values.add(e["target"])
 
-    return seed_values, seed_edges
+def _edge_match_score(edge: dict, q_tokens: set[str]) -> float:
+    """Score an edge by fuzzy matching tokens against its source and target.
+
+    For each token:
+      score_src = best similarity(token, source segments)
+      score_tgt = best similarity(token, target segments)
+      contribution = max(score_src, score_tgt)   ← the edge is relevant if
+                                                    EITHER endpoint matches
+    Return the sum of contributions across all tokens.
+    """
+    src = edge.get("source", "")
+    tgt = edge.get("target", "")
+    if not src and not tgt:
+        return 0.0
+
+    total = 0.0
+    for token in q_tokens:
+        score_src = _seg_best(token, src) if src else 0.0
+        score_tgt = _seg_best(token, tgt) if tgt else 0.0
+        total += max(score_src, score_tgt)
+    return total
 
 
 def _bfs_edges(
@@ -310,80 +283,49 @@ def _bfs_edges(
 def retrieve_context(
     question: str, graph: dict, top_k: int = _TOP_K
 ) -> tuple[list[dict], list[dict]]:
-    """Return (context_nodes, context_edges) relevant to the question.
+    """Return ([], context_edges) relevant to the question.
 
-    Edge-first lineage retrieval — no embeddings, no ML libraries:
-      1. Keyword extraction  — lowercase tokens, stopwords removed.
-      2. Name map            — resolve every edge source/target to a display name.
-      3. Fuzzy seed finding  — substring + fuzzy match (difflib) of query tokens
-                               against edge endpoint names; handles typos.
-      4. Direction detection — infer upstream / downstream / both from question
-                               vocabulary.
-      5. BFS traversal       — expand from seed endpoints along the edge graph up
-                               to _BFS_MAX_DEPTH hops; yields the lineage chain.
-      6. Fallback            — when BFS finds nothing, fall back to textual edge
-                               scoring so the chat is never empty.
-      7. Node recovery       — collect nodes referenced by context_edges, then
-                               complement with lexically-scored nodes.
-
-    Both ``nodes``/``noeuds`` and ``edges``/``arretes`` field names are accepted.
+    Pure edge-based lineage retrieval — no nodes, no embeddings:
+      1. Score every edge with _edge_match_score: for each query token compute
+         fuzzy similarity against source segments AND target segments, take the
+         max of the two, sum over all tokens.
+      2. Edges whose score >= _FUZZY_CUTOFF become BFS seeds.
+      3. BFS expands from their endpoints along the full edge graph up to
+         _BFS_MAX_DEPTH hops, following the lineage direction inferred from
+         the question vocabulary.
+      4. Fallback: if no seed reached cutoff, return all edges sorted by score
+         (best-effort for generic questions).
     """
-    nodes: list[dict] = graph.get("nodes") or graph.get("noeuds") or []
     edges: list[dict] = graph.get("edges") or graph.get("arretes") or []
 
-    if not edges and not nodes:
+    if not edges:
         return [], []
 
-    q_tokens   = _tokenize(question)
-    node_by_id = {n["id"]: n for n in nodes}
+    q_tokens = _tokenize(question)
 
-    # ── 1. Find seed edges: match tokens against source/target of each edge ──
-    seed_values, _seed_edges = _find_seed_edges(q_tokens, edges)
-    log.debug("BFS seeds (%d): %s", len(seed_values), seed_values)
+    # ── 1. Score every edge ───────────────────────────────────────────────────
+    scored = sorted(
+        ((e, _edge_match_score(e, q_tokens)) for e in edges),
+        key=lambda x: -x[1],
+    )
 
-    # ── 2. BFS lineage traversal from seeds ──────────────────────────────────
+    # ── 2. Seed edges: score >= cutoff ────────────────────────────────────────
+    seed_edges = [e for e, s in scored if s >= _FUZZY_CUTOFF]
+    seed_values: set[str] = set()
+    for e in seed_edges:
+        if e.get("source"): seed_values.add(e["source"])
+        if e.get("target"): seed_values.add(e["target"])
+    log.debug("seed edges: %d, seed values: %s", len(seed_edges), seed_values)
+
+    # ── 3. BFS from seed endpoints ────────────────────────────────────────────
     direction = _detect_direction(question)
     if seed_values:
         context_edges = _bfs_edges(seed_values, edges, direction=direction)[:top_k]
     else:
-        context_edges = []
+        # Fallback: no entity matched — return top-scored edges as-is
+        context_edges = [e for e, s in scored if s > 0][:top_k]
 
-    # ── 3. Fallback — textual edge scoring when BFS finds nothing ────────────
-    # (no seed matched: generic question not targeting a specific entity)
-    if not context_edges:
-        edge_scores     = [_score_edge(e, q_tokens, node_by_id) for e in edges]
-        sorted_edge_idx = sorted(range(len(edges)), key=lambda i: -edge_scores[i])
-        scored_idx      = [i for i in sorted_edge_idx if edge_scores[i] > 0]
-        context_edges   = [edges[i] for i in scored_idx[:top_k]]
-
-    # ── 4. Recover nodes referenced by context_edges ─────────────────────────
-    # Every endpoint that maps to a known node is included so the LLM gets
-    # the full node metadata (summary, tags…) for the lineage chain.
-    endpoint_values: set[str] = set()
-    for e in context_edges:
-        endpoint_values.add(e.get("source", ""))
-        endpoint_values.add(e.get("target", ""))
-    endpoint_values.discard("")
-
-    edge_nodes   = [node_by_id[v] for v in endpoint_values if v in node_by_id]
-    included_ids = {n["id"] for n in edge_nodes}
-
-    # Fill remaining budget with lexically-scored nodes not already present
-    budget = top_k - len(edge_nodes)
-    if budget > 0 and q_tokens:
-        extra = sorted(
-            [n for n in nodes if n["id"] not in included_ids],
-            key=lambda n: -_score_node(n, q_tokens),
-        )[:budget]
-    elif budget > 0:
-        extra = _diverse_sample(
-            [n for n in nodes if n["id"] not in included_ids], budget
-        )
-    else:
-        extra = []
-
-    context_nodes = edge_nodes + extra
-    return context_nodes, context_edges
+    return [], context_edges
 
 
 # ---------------------------------------------------------------------------

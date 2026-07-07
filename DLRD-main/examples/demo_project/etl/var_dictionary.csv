@@ -1,6 +1,0 @@
-technical_name,business_label,description
-total_amount,Total order amount,Sum of all order amounts aggregated per customer
-customer_id,Customer identifier,Unique key identifying a customer
-customer_name,Customer name,Display name of the customer
-amount,Order amount,Monetary value of a single order line
-t_customer_orders,Customer orders fact,Aggregated orders joined to their customer
